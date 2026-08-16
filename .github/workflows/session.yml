@@ -31,6 +31,11 @@ jobs:
       KEEPALIVE_SECONDS: ${{ inputs.keepalive_seconds }}
       RUNTIME_SPEC: ${{ inputs.runtime_spec }}
       SDKRUN_SESSION_SECRET: ${{ secrets.SDKRUN_SESSION_SECRET }}
+      # Optional TURN relay so the WebRTC stream crosses NAT: a Cloudflare
+      # Realtime TURN key (dash.cloudflare.com → Realtime → TURN) and an API
+      # token allowed to generate its credentials.
+      CF_TURN_KEY_ID: ${{ secrets.CF_TURN_KEY_ID }}
+      CF_TURN_API_TOKEN: ${{ secrets.CF_TURN_API_TOKEN }}
       BROKER_PORT: '7331'
       SIMDECK_PORT: '4310'
     steps:
@@ -74,6 +79,24 @@ jobs:
         run: |
           set -euo pipefail
           TOKEN="$(openssl rand -hex 24)"; echo "SIMDECK_TOKEN=$TOKEN" >> "$GITHUB_ENV"
+          if [ -n "${CF_TURN_KEY_ID:-}" ] && [ -n "${CF_TURN_API_TOKEN:-}" ]; then
+            curl -fsS -X POST "https://rtc.live.cloudflare.com/v1/turn/keys/$CF_TURN_KEY_ID/credentials/generate-ice-servers" \
+              -H "authorization: Bearer $CF_TURN_API_TOKEN" -H 'content-type: application/json' \
+              -d "{\"ttl\": $(( KEEPALIVE_SECONDS + 1800 ))}" > turn.json && python3 - <<'PY' >> "$GITHUB_ENV"
+          import json
+          d = json.load(open("turn.json")).get("iceServers")
+          s = d[0] if isinstance(d, list) else d
+          urls = s["urls"] if isinstance(s["urls"], list) else [s["urls"]]
+          print("SIMDECK_WEBRTC_ICE_SERVERS=" + ",".join(urls))
+          print("SIMDECK_WEBRTC_ICE_USERNAME=" + s["username"])
+          print("SIMDECK_WEBRTC_ICE_CREDENTIAL=" + s["credential"])
+          print("TURN=1")
+          PY
+            set -a; . <(grep -E '^SIMDECK_WEBRTC_' "$GITHUB_ENV"); set +a
+            echo "TURN relay configured"
+          else
+            echo "no TURN relay: stream works only where WebRTC can hole-punch; the page falls back to screenshots"
+          fi
           SIMDECK_VIDEO_CODEC=software SIMDECK_ALLOWED_ORIGINS='*' SIMDECK_REALTIME_STREAM=1 \
             simdeck service run --port "$SIMDECK_PORT" --bind 127.0.0.1 --video-codec software \
             --stream-quality balanced --access-token "$TOKEN" --pairing-code 000000 > simdeck.log 2>&1 &
@@ -104,7 +127,8 @@ jobs:
           import json, os
           print(json.dumps({"id": os.environ["SESSION_ID"], "status": "ready", "runId": os.environ["GITHUB_RUN_ID"],
             "brokerUrl": os.environ["BROKER_URL"], "simdeckUrl": os.environ["SIMDECK_URL"],
-            "simulator": os.environ["SIMULATOR"], "expiresAt": os.environ["EXPIRES"]}))
+            "simulator": os.environ["SIMULATOR"], "expiresAt": os.environ["EXPIRES"],
+            "stream": "turn" if os.environ.get("TURN") == "1" else "stun"}))
           PY
           curl -fsS -X POST "$REGISTER_URL" -H "authorization: Bearer $SDKRUN_SESSION_SECRET" -H 'content-type: application/json' --data @register.json
           echo "ready: $SIMULATOR · broker $BROKER_URL · until $EXPIRES"
