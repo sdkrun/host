@@ -99,8 +99,7 @@ jobs:
       - name: Register ready
         run: |
           set -euo pipefail
-          EXPIRES="$(python3 -c "import datetime,os;print((datetime.datetime.now(datetime.timezone.utc)+datetime.timedelta(seconds=int(os.environ['KEEPALIVE_SECONDS']))).isoformat())")"
-          echo "EXPIRES=$EXPIRES" >> "$GITHUB_ENV"
+          export EXPIRES="$(python3 -c "import datetime,os;print((datetime.datetime.now(datetime.timezone.utc)+datetime.timedelta(seconds=int(os.environ['KEEPALIVE_SECONDS']))).isoformat())")"
           python3 - <<'PY' > register.json
           import json, os
           print(json.dumps({"id": os.environ["SESSION_ID"], "status": "ready", "runId": os.environ["GITHUB_RUN_ID"],
