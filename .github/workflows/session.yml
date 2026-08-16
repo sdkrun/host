@@ -1,0 +1,127 @@
+name: hosted-session
+# A disposable sdk.run simulator sandbox on a free GitHub macOS runner:
+# boots a simulator, runs the sdk.run host + broker and SimDeck, exposes both
+# through Cloudflare quick tunnels, and registers the URLs with sdk.run so the
+# /sandbox page can go live for one visitor. Ends after keepalive_seconds.
+on:
+  workflow_dispatch:
+    inputs:
+      session_id:
+        description: sdk.run session id to register under
+        required: true
+      register_url:
+        description: sdk.run endpoint that receives the session URLs
+        default: https://sdk.run/api/sandbox/register
+      keepalive_seconds:
+        description: how long the session stays up once ready
+        default: '1200'
+      runtime_spec:
+        description: npm spec for @sdkrun/agent-runtime (a version, tag, or tarball URL)
+        default: '@sdkrun/agent-runtime@latest'
+
+permissions: {}
+
+jobs:
+  session:
+    runs-on: macos-26
+    timeout-minutes: 45
+    env:
+      SESSION_ID: ${{ inputs.session_id }}
+      REGISTER_URL: ${{ inputs.register_url }}
+      KEEPALIVE_SECONDS: ${{ inputs.keepalive_seconds }}
+      RUNTIME_SPEC: ${{ inputs.runtime_spec }}
+      SDKRUN_SESSION_SECRET: ${{ secrets.SDKRUN_SESSION_SECRET }}
+      BROKER_PORT: '7331'
+      SIMDECK_PORT: '4310'
+    steps:
+      - uses: actions/setup-node@v4
+        with:
+          node-version: 24
+
+      - name: Report starting
+        run: |
+          curl -fsS -X POST "$REGISTER_URL" -H "authorization: Bearer $SDKRUN_SESSION_SECRET" \
+            -H 'content-type: application/json' \
+            -d "{\"id\":\"$SESSION_ID\",\"status\":\"booting\",\"runId\":\"$GITHUB_RUN_ID\"}" || true
+
+      - name: Install tools
+        run: |
+          set -euo pipefail
+          npm i -g simdeck@latest "$RUNTIME_SPEC"
+          arch="$(uname -m)"; case "$arch" in arm64) a=arm64;; *) a=amd64;; esac
+          mkdir -p "$RUNNER_TEMP/cf"
+          curl -fsSL "https://github.com/cloudflare/cloudflared/releases/latest/download/cloudflared-darwin-${a}.tgz" | tar -xz -C "$RUNNER_TEMP/cf"
+          chmod +x "$RUNNER_TEMP/cf/cloudflared"
+          echo "$RUNNER_TEMP/cf" >> "$GITHUB_PATH"
+
+      - name: Start sandbox (simulator + host + broker)
+        run: |
+          set -euo pipefail
+          SDKRUN_ALLOWED_ORIGINS='https://sdk.run,https://www.sdk.run,https://dev.sdk.run,http://localhost:3060' \
+            sdkrun-runtime ios --no-simdeck --port "$BROKER_PORT" > runtime.log 2>&1 &
+          echo $! > runtime.pid
+          for i in $(seq 1 240); do
+            if curl -fsS "http://127.0.0.1:$BROKER_PORT/status" 2>/dev/null | grep -q '"hostConnected":true'; then break; fi
+            if ! kill -0 "$(cat runtime.pid)" 2>/dev/null; then cat runtime.log; echo "runtime exited" >&2; exit 1; fi
+            sleep 2
+          done
+          curl -fsS "http://127.0.0.1:$BROKER_PORT/status" | tee status.json
+          grep -q '"hostConnected":true' status.json || { cat runtime.log; echo "host never connected" >&2; exit 1; }
+          echo "UDID=$(python3 -c 'import json;print(json.load(open("status.json"))["simulator"]["udid"])')" >> "$GITHUB_ENV"
+          echo "SIMULATOR=$(python3 -c 'import json;s=json.load(open("status.json"))["simulator"];print(s["name"]+" · "+s["runtime"])')" >> "$GITHUB_ENV"
+
+      - name: Start SimDeck
+        run: |
+          set -euo pipefail
+          TOKEN="$(openssl rand -hex 24)"; echo "SIMDECK_TOKEN=$TOKEN" >> "$GITHUB_ENV"
+          SIMDECK_VIDEO_CODEC=software SIMDECK_ALLOWED_ORIGINS='*' SIMDECK_REALTIME_STREAM=1 \
+            simdeck service run --port "$SIMDECK_PORT" --bind 127.0.0.1 --video-codec software \
+            --stream-quality balanced --access-token "$TOKEN" --pairing-code 000000 > simdeck.log 2>&1 &
+          echo $! > simdeck.pid
+          for i in $(seq 1 120); do
+            curl -fsS "http://127.0.0.1:$SIMDECK_PORT/api/health?simdeckToken=$TOKEN" >/dev/null 2>&1 && break
+            kill -0 "$(cat simdeck.pid)" 2>/dev/null || { cat simdeck.log; exit 1; }
+            sleep 0.5
+          done
+          curl -fsS "http://127.0.0.1:$SIMDECK_PORT/api/health?simdeckToken=$TOKEN" >/dev/null
+
+      - name: Open tunnels
+        run: |
+          set -euo pipefail
+          cloudflared tunnel --url "http://127.0.0.1:$BROKER_PORT" --protocol http2 --no-autoupdate > cf-broker.log 2>&1 &
+          cloudflared tunnel --url "http://127.0.0.1:$SIMDECK_PORT" --protocol http2 --no-autoupdate > cf-simdeck.log 2>&1 &
+          url() { for i in $(seq 1 120); do u="$(grep -Eo 'https://[-a-zA-Z0-9.]+\.trycloudflare\.com' "$1" | head -n1 || true)"; [ -n "$u" ] && { echo "$u"; return; }; sleep 0.5; done; cat "$1" >&2; return 1; }
+          BROKER_URL="$(url cf-broker.log)"; SIMDECK_URL="$(url cf-simdeck.log)"
+          for i in $(seq 1 60); do curl -fsS "$BROKER_URL/status" >/dev/null 2>&1 && break; sleep 1; done
+          echo "BROKER_URL=$BROKER_URL" >> "$GITHUB_ENV"
+          echo "SIMDECK_URL=$SIMDECK_URL/?device=$UDID&simdeckToken=$SIMDECK_TOKEN&remoteStream=1" >> "$GITHUB_ENV"
+
+      - name: Register ready
+        run: |
+          set -euo pipefail
+          EXPIRES="$(python3 -c "import datetime,os;print((datetime.datetime.now(datetime.timezone.utc)+datetime.timedelta(seconds=int(os.environ['KEEPALIVE_SECONDS']))).isoformat())")"
+          echo "EXPIRES=$EXPIRES" >> "$GITHUB_ENV"
+          python3 - <<'PY' > register.json
+          import json, os
+          print(json.dumps({"id": os.environ["SESSION_ID"], "status": "ready", "runId": os.environ["GITHUB_RUN_ID"],
+            "brokerUrl": os.environ["BROKER_URL"], "simdeckUrl": os.environ["SIMDECK_URL"],
+            "simulator": os.environ["SIMULATOR"], "expiresAt": os.environ["EXPIRES"]}))
+          PY
+          curl -fsS -X POST "$REGISTER_URL" -H "authorization: Bearer $SDKRUN_SESSION_SECRET" -H 'content-type: application/json' --data @register.json
+          echo "ready: $SIMULATOR · broker $BROKER_URL · until $EXPIRES"
+
+      - name: Keep alive
+        run: |
+          end=$(( $(date +%s) + KEEPALIVE_SECONDS ))
+          while [ "$(date +%s)" -lt "$end" ]; do
+            curl -fsS "http://127.0.0.1:$BROKER_PORT/status" >/dev/null 2>&1 || { echo "broker died"; break; }
+            sleep 15
+          done
+
+      - name: Report ended
+        if: always()
+        run: |
+          curl -fsS -X POST "$REGISTER_URL" -H "authorization: Bearer $SDKRUN_SESSION_SECRET" \
+            -H 'content-type: application/json' \
+            -d "{\"id\":\"$SESSION_ID\",\"status\":\"ended\",\"runId\":\"$GITHUB_RUN_ID\"}" || true
+          tail -20 runtime.log 2>/dev/null || true
