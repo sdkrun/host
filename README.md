@@ -26,6 +26,10 @@ ns build ios --release            # platforms/ios/build/Release-iphonesimulator/
 
 Tags `v*` build and attach `sdkrunhost-ios.zip` to a GitHub Release; the runtime downloads the release matching its pinned host version.
 
+## Hosted sessions
+
+`.github/workflows/session.yml` runs a disposable sandbox on a GitHub macOS runner for the [sdk.run/sandbox](https://sdk.run/sandbox) page: it boots a simulator, installs this host, runs `@sdkrun/agent-runtime ios` and SimDeck, exposes both through Cloudflare quick tunnels, and registers the URLs with sdk.run (`register_url`, bearer `SDKRUN_SESSION_SECRET`). Sessions last `keepalive_seconds` (default 20 minutes). Optional repo secrets `CF_TURN_KEY_ID` / `CF_TURN_API_TOKEN` (a Cloudflare Realtime TURN key) let the WebRTC stream cross NAT; without them the page falls back to screenshots.
+
 ## Security
 
 Snippets execute with the simulator app's privileges on the simulator, brokered only over loopback. This is a local development tool for code you or your agent wrote; do not expose the broker to untrusted callers.
