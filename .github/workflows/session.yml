@@ -82,17 +82,18 @@ jobs:
           if [ -n "${CF_TURN_KEY_ID:-}" ] && [ -n "${CF_TURN_API_TOKEN:-}" ]; then
             curl -fsS -X POST "https://rtc.live.cloudflare.com/v1/turn/keys/$CF_TURN_KEY_ID/credentials/generate-ice-servers" \
               -H "authorization: Bearer $CF_TURN_API_TOKEN" -H 'content-type: application/json' \
-              -d "{\"ttl\": $(( KEEPALIVE_SECONDS + 1800 ))}" > turn.json && python3 - <<'PY' >> "$GITHUB_ENV"
-          import json
+              -d "{\"ttl\": $(( KEEPALIVE_SECONDS + 1800 ))}" > turn.json
+            python3 - <<'PY' > turn.env
+          import json, shlex
           d = json.load(open("turn.json")).get("iceServers")
           s = d[0] if isinstance(d, list) else d
           urls = s["urls"] if isinstance(s["urls"], list) else [s["urls"]]
-          print("SIMDECK_WEBRTC_ICE_SERVERS=" + ",".join(urls))
-          print("SIMDECK_WEBRTC_ICE_USERNAME=" + s["username"])
-          print("SIMDECK_WEBRTC_ICE_CREDENTIAL=" + s["credential"])
-          print("TURN=1")
+          print("export SIMDECK_WEBRTC_ICE_SERVERS=" + shlex.quote(",".join(urls)))
+          print("export SIMDECK_WEBRTC_ICE_USERNAME=" + shlex.quote(s["username"]))
+          print("export SIMDECK_WEBRTC_ICE_CREDENTIAL=" + shlex.quote(s["credential"]))
           PY
-            set -a; . <(grep -E '^SIMDECK_WEBRTC_' "$GITHUB_ENV"); set +a
+            . ./turn.env
+            echo "TURN=1" >> "$GITHUB_ENV"
             echo "TURN relay configured"
           else
             echo "no TURN relay: stream works only where WebRTC can hole-punch; the page falls back to screenshots"
