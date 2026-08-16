@@ -1,0 +1,33 @@
+name: release
+on:
+  push:
+    tags: ['v*']
+  workflow_dispatch:
+
+permissions:
+  contents: write
+
+jobs:
+  ios:
+    runs-on: macos-15
+    steps:
+      - uses: actions/checkout@v4
+      - uses: actions/setup-node@v4
+        with:
+          node-version: 24
+      - name: Select Xcode
+        run: sudo xcode-select -s /Applications/Xcode_26.app || ls /Applications | grep -i xcode
+      - run: npm ci
+      - run: npm i -g nativescript
+      - run: ns build ios --release
+      - name: Package
+        run: |
+          cd platforms/ios/build/Release-iphonesimulator
+          ditto -c -k --keepParent sdkrunhost.app sdkrunhost-ios.zip
+          shasum -a 256 sdkrunhost-ios.zip > sdkrunhost-ios.zip.sha256
+      - uses: softprops/action-gh-release@v2
+        if: startsWith(github.ref, 'refs/tags/')
+        with:
+          files: |
+            platforms/ios/build/Release-iphonesimulator/sdkrunhost-ios.zip
+            platforms/ios/build/Release-iphonesimulator/sdkrunhost-ios.zip.sha256
